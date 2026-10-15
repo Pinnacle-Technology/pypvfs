@@ -649,7 +649,6 @@ class PvfsFile:
     @classmethod
     def open(cls, filename):
         """Open an existing VFS file."""
-        print(f"Python: Opening VFS file: {filename}")
         try:
             # Check if file exists
             if not os.path.exists(filename):
@@ -662,7 +661,6 @@ class PvfsFile:
             
             instance = cls()
             instance._wrapper = wrapper
-            print("Python: Successfully opened VFS")
             return instance
         except Exception as e:
             print(f"Python: Error opening VFS: {str(e)}")

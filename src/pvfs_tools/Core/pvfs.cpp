@@ -2113,7 +2113,6 @@ std::int32_t PVFS_overwrite ( std::shared_ptr<PvfsFile> &vfs, const char * vfs_f
     if ( vfs_filename == NULL ) return PVFS_ARG_NULL;
     if ( disk_filename == NULL ) return PVFS_ARG_NULL;
 
-    std::cout << "PVFS_Overwrite" << std::endl;
 #ifdef _WIN32
     fd = _open ( disk_filename, _O_BINARY | _O_RDWR, _S_IREAD );
     if ( fd == PVFS_INVALID_FD ) return PVFS_FILE_NOT_OPENED;

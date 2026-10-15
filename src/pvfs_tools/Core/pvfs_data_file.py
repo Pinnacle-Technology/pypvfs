@@ -76,40 +76,30 @@ class PvfsDataFile:
             return False
         
         try:
-            print(f"  - Creating PVFS file: {filename}")
-            
             # Create the PVFS file
             self._pvfs = PvfsFile.create(filename)
             if not self._pvfs:
                 print("  - Failed to create PVFS file object")
                 return False
             
-            print("  - PVFS file object created successfully")
-            
             # Create in-memory database (like the C++ implementation)
-            print(f"  - Creating in-memory database")
             pvfs_dir = Path(filename).parent
             temp_db_path = str((pvfs_dir / f"temp_{self._unique_id}.db3").absolute())
 
             self._database = ExperimentDatabase(filename=temp_db_path, in_memory=False)
             self._temp_db_path = temp_db_path
             self._owns_temp_db = True
-            print("  - ExperimentDatabase instance created")
             # Create DB file and tables (only once; second create() would try to remove
             # the file while it is open and fail)
             db_create_result = self._database.create(temp_db_path)
-            print(f"  - Database create result: {db_create_result}")
             if not db_create_result:
                 print("  - Failed to create database")
                 return False
-            
-            print("  - Database created successfully")
             
             # Set file information before _save_database so temp files go next to PVFS
             file_path = Path(filename)
             self._filename = file_path.name
             self._filepath = str(file_path.absolute())
-            print(f"  - File info set: {self._filename} -> {self._filepath}")
             
             # Write experiment.db3 and experiment_backup.db3 into the PVFS first so they
             # are the first two channels (required by standard PVFS layout)
@@ -188,8 +178,6 @@ class PvfsDataFile:
         unique_id = self._unique_id
 
         try:
-            print("  - Closing PVFS file and saving database...")
-
             if self._database and self._pvfs:
                 self.flush()
 
@@ -211,7 +199,6 @@ class PvfsDataFile:
                 self._pvfs.close()
                 self._pvfs = None
 
-            print("  - PVFS file closed successfully")
             return True
 
         except Exception as e:
@@ -466,14 +453,12 @@ class PvfsDataFile:
             return False
         
         try:
-            print(f"    - Loading database from PVFS...")
             # Create database
             self._database = ExperimentDatabase()
             
             # Try to extract database from PVFS (same dir as PVFS to avoid polluting cwd)
             temp_dir = Path(self._filepath).parent if self._filepath else Path.cwd()
             temp_db_path = str(temp_dir / f"temp_{self._unique_id}.db3")
-            print(f"    - Temporary database path: {temp_db_path}")
             
             # Try different possible database filenames
             db_filenames = [
@@ -482,15 +467,10 @@ class PvfsDataFile:
                 self.EXPERIMENT_DB_BACKUP_FILENAME
             ]
             
-            print(f"    - Trying database filenames: {db_filenames}")
-            
             for db_filename in db_filenames:
                 try:
-                    print(f"    - Attempting to extract: {db_filename}")
                     result = self._pvfs.extract(db_filename, temp_db_path)
-                    print(f"    - Extract result for {db_filename}: {result}")
                     if result == 0 and os.path.exists(temp_db_path):
-                        print(f"    - Successfully extracted {db_filename} to {temp_db_path}")
                         # Load the database
                         self._database = ExperimentDatabase(filename=temp_db_path, in_memory=False)
                         if self._database:
@@ -509,7 +489,6 @@ class PvfsDataFile:
                     print(f"    - Exception during extract of {db_filename}: {e}")
                     continue
             
-            print(f"    - No database found, creating in-memory database")
             # If no database found, create a new one (same dir as PVFS)
             temp_dir = Path(self._filepath).parent if self._filepath else Path.cwd()
             temp_db_path = str(temp_dir / f"temp_{self._unique_id}.db3")

@@ -77,7 +77,6 @@ class VideoDataFile:
         if not self._index_file:
             return
             
-        print("Reading header...")
         # Read magic bytes ("PVID")
         magic = self._index_file.read(4)
         if magic != b'PVID':
@@ -110,18 +109,14 @@ class VideoDataFile:
                     
         # Set start and end times
         if self._frame_count > 1:
-            print("Reading start and end times...")
             self._start_time, _ = self._read_frame_header(0)  # First frame
-            print(f"Start time: {self._start_time}")
             self._end_time, _ = self._read_frame_header(self._frame_count - 1)  # Last frame
-            print(f"End time: {self._end_time}")
 
             if self._start_time and self._end_time:
                 dt = (self._end_time.seconds + self._end_time.subseconds) - (self._start_time.seconds + self._start_time.subseconds)
                 if dt > 0:
                     self._frame_rate = (self._frame_count - 1) / dt
 
-            print(f"Frame rate {self._frame_rate}")
             
     def close(self) -> None:
         """Close the video stream files."""
@@ -185,20 +180,16 @@ class VideoDataFile:
             # Check marker bytes
 #            for i in range(8):
 #                marker = self._index_file.fread_uint8()
-#                print(f"{marker:02x}")
 #                if marker != self.UNIQUE_MARKER_BYTE:
-#                    print(f"Invalid marker byte at position {i}: {marker}")
 #                    return None, -1
                     
             # Read timestamp
             seconds = self._index_file.fread_int64()
             subseconds = self._index_file.fread_double()
-#            print(f"timestamp {seconds}  {subseconds}")
             timestamp = HighTime(seconds, subseconds)
             
             # Read frame location
             frame_location = self._index_file.fread_int64()
-#            print(f"frame location {frame_location}")
             
             return timestamp, frame_location
             
@@ -219,20 +210,10 @@ class VideoDataFile:
         show_frame = (b0 >> 4) & 0x01
         first_partition_size = ((b0 >> 5) | (b1 << 3) | (b2 << 11)) & 0x7FFFF
 
-#        print(f"Frame type: {'key' if frame_type == 0 else 'inter'}")
-#        print(f"Version: {version}")
-#        print(f"Show Frame: {show_frame}")
-#        print(f"First partition size: {first_partition_size}")
-
         # If it's a key frame, check for the magic number
         if frame_type == 0:
             if frame_data[3:6] != b'\x9D\x01\x2A':
-#                print("Missing VP8 sync code")
                 return False
-#            else:
-#                print("Valid VP8 keyframe header")
-#        else:
-#            print("Non-keyframe — sync code not required")
 
         return True
             
@@ -255,12 +236,10 @@ class VideoDataFile:
             # Check marker byte
 #            marker = self._frames_file.fread_uint8()
 #            if marker != self.UNIQUE_MARKER_BYTE:
-#                print(f"Invalid marker byte at location {location}: {marker:02x}")
 #                return None
                 
             # Read frame size
             frame_size = self._frames_file.fread_uint32()
-#            print(f"Frame size {frame_size}")
             if frame_size <= 0 or frame_size > 1024 * 1024 * 10:  # Sanity check: max 10MB per frame
                 print(f"Invalid frame size at location {location}: {frame_size}")
                 return None
@@ -270,7 +249,6 @@ class VideoDataFile:
 
             if frame_data:
                 is_valid = self.check_vp8_header(frame_data)
-#                print(f"VP8 header valid: {is_valid}")
 
             if len(frame_data) != frame_size:
                 print(f"Failed to read complete frame data. Expected {frame_size} bytes, got {len(frame_data)}")
@@ -305,7 +283,6 @@ class VideoDataFile:
         _, frame_location = self._read_frame_header(frame_index)
         if frame_location < 0:
             return None
-#        print(f"frame index and location {frame_index}  {frame_location}")
             
         # Read frame data
         self._current_frame_index = frame_index
@@ -361,10 +338,6 @@ class VideoDataFile:
         
     def is_valid(self) -> bool:
         """Check if the video stream is valid."""
-        print(f"frames_file: {self._frames_file}")
-        print(f"index_file: {self._index_file}")
-        print(f"start_time: {self._start_time}")
-        print(f"end_time: {self._end_time}")
         return (self._frames_file is not None and 
                 self._index_file is not None and 
                 self._start_time is not None and 

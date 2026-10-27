@@ -29,16 +29,22 @@ jobs:
       # No extra system setup is required.
 
       - name: Install package with test extras
-        # NOTE: deliberately not editable (`-e`). In scikit-build-core's
-        # default editable ("redirect") mode the Python source is imported
-        # from src/pvfs_tools/, but CMake-built native libraries live in the
-        # build/ directory. pvfs_binding.py loads its DLL/.so from
-        # Path(__file__).parent, so under `-e` it would look in the source
-        # tree and fail. A regular install also validates exactly what users
-        # get from PyPI.
+        # Validate a regular install first, then the editable layout below.
         run: |
           python -m pip install --upgrade pip
           pip install ".[test]" -v
 
       - name: Run tests
         run: pytest -q
+
+      - name: Check editable install
+        run: |
+          python -m pip install -e . "--config-settings=build-dir=build/editable-tests"
+          python -c "from pathlib import Path; from pvfs_tools.Core import pvfs_binding as m; assert Path(m._get_lib()._name).parent != Path(m.__file__).parent"
+          python -m pytest tests/test_native_loading.py tests/test_compatibility.py -q
+
+      - name: Check native wrapper contract
+        run: |
+          cmake -S . -B build/native-tests -DPVFS_BUILD_TESTS=ON
+          cmake --build build/native-tests --config Release --parallel 2
+          ctest --test-dir build/native-tests -C Release --output-on-failure

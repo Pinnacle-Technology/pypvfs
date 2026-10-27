@@ -149,6 +149,26 @@ WRAPPER_DLL_EXPORT PvfsFileWrapper* open_vfs(const char* filename) {
     }
 }
 
+WRAPPER_DLL_EXPORT PvfsFileWrapper* open_vfs_readonly(const char* filename) {
+    if (!filename) return nullptr;
+    try {
+        auto wrapper = std::make_unique<PvfsFileWrapper>();
+        wrapper->ptr = pvfs::PVFS_open_readonly(filename);
+        return wrapper->ptr ? wrapper.release() : nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+WRAPPER_DLL_EXPORT int32_t pvfs_overwrite(PvfsFileWrapper* vfs, const char* filename, const char* disk_filename) {
+    if (!vfs || !vfs->ptr || !filename || !disk_filename) return pvfs::PVFS_ARG_NULL;
+    try {
+        return pvfs::PVFS_overwrite(vfs->ptr, filename, disk_filename);
+    } catch (...) {
+        return pvfs::PVFS_ERROR;
+    }
+}
+
 WRAPPER_DLL_EXPORT PvfsFileHandleWrapper* create_file(PvfsFileWrapper* vfs, const char* filename) {
     if (!vfs || !vfs->ptr) return nullptr;
     auto handle = new PvfsFileHandleWrapper();
@@ -316,6 +336,9 @@ WRAPPER_DLL_EXPORT int32_t write_index_file_header(PvfsFileHandleWrapper* handle
     index_header.datarate = header->datarate;
     index_header.startTime = header->startTime;
     index_header.endTime = header->endTime;
+    // This legacy C wrapper does not expose the interval; never serialize
+    // uninitialized stack data. Match IndexedHeader's default interval.
+    index_header.timeStampIntervalSeconds = 10;
     return pvfs::PVFS_write_index_file_header(handle->ptr, index_header);
 }
 
@@ -366,9 +389,9 @@ WRAPPER_DLL_EXPORT int32_t pvfs_fclose(PvfsFileHandleWrapper* handle) {
     return static_cast<int32_t>(pvfs::PVFS_fclose(handle->ptr));
 }
 
-WRAPPER_DLL_EXPORT int32_t pvfs_flush(PvfsFileHandleWrapper* handle) {
+WRAPPER_DLL_EXPORT int32_t pvfs_flush(PvfsFileHandleWrapper* handle, int32_t commit) {
     if (!handle || !handle->ptr) return pvfs::PVFS_ARG_NULL;
-    return static_cast<int32_t>(pvfs::PVFS_flush(handle->ptr));
+    return static_cast<int32_t>(pvfs::PVFS_flush(handle->ptr, commit != 0));
 }
 
 WRAPPER_DLL_EXPORT PvfsFileHandleWrapper* pvfs_fcreate(PvfsFileWrapper* vfs, const char* filename) {
@@ -423,26 +446,11 @@ WRAPPER_DLL_EXPORT int32_t extract(PvfsFileWrapper* vfs, const char* in_file, co
     if (!vfs || !vfs->ptr) return pvfs::PVFS_ARG_NULL;
     if (!in_file || !out_file) return pvfs::PVFS_ARG_NULL;
 
-    PvfsFileHandleWrapper* h = pvfs_fopen(vfs, in_file);
-    if (!h) return pvfs::PVFS_FILE_NOT_OPENED;
-
-    std::ofstream out(out_file, std::ios::binary);
-    if (!out.good()) {
-        pvfs_fclose(h);
-        delete h;
-        return pvfs::PVFS_FILE_NOT_OPENED;
+    try {
+        return pvfs::PVFS_extract(vfs->ptr, in_file, out_file);
+    } catch (...) {
+        return pvfs::PVFS_ERROR;
     }
-
-    std::uint8_t buffer[1024];
-    int32_t rv;
-    while ((rv = pvfs_read(h, buffer, 1024)) > 0) {
-        out.write(reinterpret_cast<const char*>(buffer), static_cast<std::streamsize>(rv));
-    }
-
-    pvfs_fclose(h);
-    delete h;
-    out.close();
-    return pvfs::PVFS_OK;
 }
 
 // Add type-specific write functions
@@ -639,4 +647,4 @@ WRAPPER_DLL_EXPORT void pvfs_close_vfs(PvfsFileWrapper* wrapper) {
     }
 }
 
-} 
+}

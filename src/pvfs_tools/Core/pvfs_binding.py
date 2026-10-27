@@ -1,5 +1,6 @@
 import ctypes
 import os
+import sys
 from pathlib import Path
 
 from datetime import datetime, timezone
@@ -127,15 +128,23 @@ lock_vfs(vfs: PvfsFileWrapper) -> None:                   PVFS_lock(vfs)
 unlock_vfs(vfs: PvfsFileWrapper) -> None:                 PVFS_unlock(vfs)
 """
 
-# Load the shared library (lazy: only on first use, so import succeeds when lib is missing)
-def load_library():
-    # Get the directory containing this script
+# Editable installs split Python sources and CMake-installed libraries between
+# package paths. Prefer installed libraries over stale source-tree binaries.
+def _library_path():
     current_dir = Path(__file__).parent.absolute()
-    if os.name == 'nt':  # Windows
-        lib_path = current_dir / "pvfs_wrapper.dll"
-    else:  # Linux/Mac
-        lib_path = current_dir / "libpvfs_wrapper.so"
-    return ctypes.CDLL(str(lib_path))
+    name = "pvfs_wrapper.dll" if os.name == "nt" else "libpvfs_wrapper.so"
+    package_paths = getattr(sys.modules.get(__package__), "__path__", ())
+    directories = [Path(p).absolute() for p in package_paths]
+    directories = [p for p in directories if p != current_dir] + [current_dir]
+    for directory in directories:
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    return current_dir / name
+
+
+def load_library():
+    return ctypes.CDLL(str(_library_path()))
 
 _lib = None
 _load_error = None  # Store first load failure for clearer error messages
@@ -222,20 +231,20 @@ class PvfsBlockFileWrapper(ctypes.Structure):
         ("filename", ctypes.c_char * 256)
     ]
 
+class PvfsHighTimeWrapper(ctypes.Structure):
+    _fields_ = [
+        ("seconds", ctypes.c_int64),
+        ("subseconds", ctypes.c_double)
+    ]
+
 class PvfsIndexHeaderWrapper(ctypes.Structure):
     _fields_ = [
         ("magicNumber", ctypes.c_int32),
         ("version", ctypes.c_int32),
         ("dataType", ctypes.c_int32),
         ("datarate", ctypes.c_double),
-        ("startTime", ctypes.c_int64),
-        ("endTime", ctypes.c_int64)
-    ]
-
-class PvfsHighTimeWrapper(ctypes.Structure):
-    _fields_ = [
-        ("seconds", ctypes.c_int64),
-        ("subseconds", ctypes.c_double)
+        ("startTime", PvfsHighTimeWrapper),
+        ("endTime", PvfsHighTimeWrapper)
     ]
 
 # Set up function signatures (only when library loaded)
@@ -245,6 +254,12 @@ if _lib is not None:
 
     _get_lib().open_vfs.argtypes = [ctypes.c_char_p]
     _get_lib().open_vfs.restype = ctypes.POINTER(PvfsFileWrapper)
+
+    _get_lib().open_vfs_readonly.argtypes = [ctypes.c_char_p]
+    _get_lib().open_vfs_readonly.restype = ctypes.POINTER(PvfsFileWrapper)
+
+    _get_lib().pvfs_overwrite.argtypes = [ctypes.POINTER(PvfsFileWrapper), ctypes.c_char_p, ctypes.c_char_p]
+    _get_lib().pvfs_overwrite.restype = ctypes.c_int32
 
     _get_lib().create_file.argtypes = [ctypes.POINTER(PvfsFileWrapper), ctypes.c_char_p]
     _get_lib().create_file.restype = ctypes.POINTER(PvfsFileHandleWrapper)
@@ -647,15 +662,19 @@ class PvfsFile:
         return self._wrapper is not None
 
     @classmethod
-    def open(cls, filename):
-        """Open an existing VFS file."""
+    def open(cls, filename, read_only: bool = False):
+        """Open a VFS for writing, or explicitly request a shared read-only handle.
+
+        A writable open never falls back to read-only when another writer holds it.
+        """
         try:
             # Check if file exists
             if not os.path.exists(filename):
                 raise FileNotFoundError(f"VFS file does not exist: {filename}")
             
             # Try to open the file
-            wrapper = _get_lib().open_vfs(filename.encode('utf-8'))
+            opener = _get_lib().open_vfs_readonly if read_only else _get_lib().open_vfs
+            wrapper = opener(filename.encode('utf-8'))
             if not wrapper:
                 raise RuntimeError(f"Failed to open VFS file: {filename}")
             
@@ -713,10 +732,35 @@ class PvfsFile:
         return names
 
     def extract(self, in_file, out_file):
-        result = _get_lib().extract(self._wrapper, in_file.encode('utf-8'), out_file.encode('utf-8'))
+        """Extract a file while holding the PVFS lock; raise on any copy failure."""
+        self.lock()
+        try:
+            result = _get_lib().extract(self._wrapper, in_file.encode('utf-8'), out_file.encode('utf-8'))
+        finally:
+            self.unlock()
         if result < 0:
             raise RuntimeError(f"Failed to extract file: {result}")
         return result
+
+    def overwrite(self, filename, disk_filename, *, lock: bool = True):
+        """Stage a disk file and replace/create its PVFS entry.
+
+        Pass lock=False only when already holding this VFS's lock. Close handles
+        to the target before replacing it. This does not force a disk commit and
+        the directory update is not power-loss atomic.
+        """
+        if lock:
+            self.lock()
+        try:
+            result = _get_lib().pvfs_overwrite(
+                self._wrapper, filename.encode('utf-8'), os.fsencode(disk_filename)
+            )
+            if result < 0:
+                raise RuntimeError(f"Failed to overwrite file {filename}: {result}")
+            return result
+        finally:
+            if lock:
+                self.unlock()
 
     def open_data_channel(self, channel_name):
         handle = _get_lib().open_data_channel(self._wrapper, channel_name.encode('utf-8'))
@@ -777,14 +821,11 @@ class PvfsFileHandle:
 
     def __del__(self):
         """Clean up the file handle when the object is destroyed."""
-        if not self._closed and hasattr(self, 'handle') and self.handle:
+        if not getattr(self, '_closed', True) and getattr(self, 'handle', None):
             try:
-                # Don't try to access _lib during cleanup as it might be gone
-                # Just mark the handle as closed
-                self._closed = True
-                self.handle = None
-            except:
-                pass  # Ignore all errors during cleanup
+                self.close()
+            except Exception:
+                pass  # The library may already be gone during interpreter shutdown.
 
     def close(self):
         """Close the file handle."""
@@ -803,14 +844,12 @@ class PvfsFileHandle:
                 except Exception as e:
                     print(f"Warning: Failed to flush file handle: {e}")
             
-            # Close the handle: pvfs_fclose first (commits/flushes in C), then
-            # pvfs_close_file_handle (releases handle->ptr). Reversing the order
-            # invalidates the ptr before fclose, causing -2 and data not persisted.
+            # Flush/close the native file, then delete the C wrapper allocation.
             try:
                 result = _get_lib().pvfs_fclose(self.handle)
                 if result < 0:
                     print(f"Warning: Failed to close file handle: {result}")
-                _get_lib().pvfs_close_file_handle(self.handle)
+                _get_lib().close_file(self.handle)
             except Exception as e:
                 print(f"Warning: Failed to close file handle: {e}")
         finally:
@@ -1140,4 +1179,4 @@ class PvfsFileHandle:
 
 def create_vfs(block_size):
     """Create a new VFS with the specified block size."""
-    return PvfsFile(block_size) 
+    return PvfsFile(block_size)

@@ -70,14 +70,15 @@ class PvfsDataFile:
             raise RuntimeError("Cannot create file in read-only mode")
         
         # Close any existing file
-        self.close()
+        if not self.close():
+            return False
         
         if not filename:
             return False
         
         try:
             # Create the PVFS file
-            self._pvfs = PvfsFile.create(filename)
+            self._pvfs = PvfsFile.create(filename, block_size=block_size)
             if not self._pvfs:
                 print("  - Failed to create PVFS file object")
                 return False
@@ -131,11 +132,12 @@ class PvfsDataFile:
             return False
         
         # Close any existing file
-        self.close()
+        if not self.close():
+            return False
         
         try:
             # Try to open the PVFS file
-            self._pvfs = PvfsFile.open(filename)
+            self._pvfs = PvfsFile.open(filename, read_only=self._read_only)
             if not self._pvfs:
                 return False
             
@@ -181,6 +183,15 @@ class PvfsDataFile:
             if self._database and self._pvfs:
                 self.flush()
 
+            # Release channel handles before the VFS so the native writer lock
+            # is released by close(), even while this Python object stays alive.
+            for channel in self._indexed_data_files.values():
+                channel.close()
+            self._indexed_data_files.clear()
+            for video in self._video_files.values():
+                video.close()
+            self._video_files.clear()
+
             # Close the database first so temp files are released (required before remove on Windows)
             if self._database:
                 self._database.close()
@@ -202,15 +213,12 @@ class PvfsDataFile:
             return True
 
         except Exception as e:
+            # Retain the working database and handles for a retry; never delete
+            # unsaved metadata after a flush error.
             print(f"Error closing PVFS file: {e}")
             import traceback
             traceback.print_exc()
             return False
-        finally:
-            # Always attempt temp file cleanup so they are not left behind if close() failed
-            _try_remove(temp_db_path)
-            _try_remove(snapshot_path)
-            _try_remove(Path.cwd() / f"temp_snapshot_{unique_id}.db3")
     
     def flush(self, synchronous: bool = True) -> None:
         """Flush all data to disk.
@@ -218,6 +226,8 @@ class PvfsDataFile:
         Args:
             synchronous: Whether to flush synchronously
         """
+        if self._read_only:
+            return
         # Flush indexed data files
         for indexed_file in self._indexed_data_files.values():
             if indexed_file:
@@ -250,7 +260,8 @@ class PvfsDataFile:
                     self._database.update_experiment_start_time(earliest_start)
                 except Exception:
                     pass
-        self._save_database()
+        if not self._save_database(commit=synchronous):
+            raise RuntimeError("Failed to save the PVFS database")
 
     
     def create_channel(self, channel_name: str, data_rate: float = 1.0, 
@@ -503,11 +514,12 @@ class PvfsDataFile:
             print(f"Error loading database: {e}")
             return False
     
-    def _save_database(self, targets: Optional[list[str]] = None) -> bool:
-        """Write the current database into the PVFS as experiment.db3 and experiment_backup.db3.
-        Uses fcreate (empty file in VFS) then writes snapshot bytes; create_file/PVFS_add would
-        require a disk file of that name.
-        """
+    def _save_database(self, targets: Optional[list[str]] = None, *, commit: bool = True) -> bool:
+        """Replace primary then backup from one snapshot, stopping on the first failure."""
+        if self._read_only:
+            return True
+        if not self._pvfs or not self._database:
+            return False
         targets = targets or [self.EXPERIMENT_DB_FILENAME, self.EXPERIMENT_DB_BACKUP_FILENAME]
         # 1) Make the working DB durable, then produce a snapshot file (same dir as PVFS)
         temp_dir = Path(self._filepath).parent if self._filepath else Path.cwd()
@@ -524,44 +536,34 @@ class PvfsDataFile:
             except OSError:
                 if not self._database.save_to_file(snapshot_path):
                     return False
-            with open(snapshot_path, "rb") as f:
-                db_data = f.read()
-            if len(db_data) == 0:
+            if os.path.getsize(snapshot_path) == 0:
                 return False
+
+            # Serialize both replacements with channel operations using the same
+            # native lock. Keep the snapshot until the core has read both copies.
+            self._pvfs.lock()
+            try:
+                for name in targets:
+                    if self._pvfs.overwrite(name, snapshot_path, lock=False) != 0:
+                        return False
+                    if commit:
+                        handle = self._pvfs.fopen(name)
+                        try:
+                            if handle.flush(commit=True) != 0:
+                                return False
+                        finally:
+                            handle.close()
+                return True
+            finally:
+                self._pvfs.unlock()
+        except Exception as e:
+            print(f"Error saving PVFS database: {e}")
+            return False
         finally:
             try:
                 os.remove(snapshot_path)
             except OSError:
                 pass
-
-        # 2) write the same bytes to each target inside PVFS (fcreate = new empty file in VFS)
-        CHUNK = 1024
-        ok = True
-        for name in targets:
-            try:
-                self._pvfs.delete_file(name)
-            except Exception:
-                pass  # ignore if file did not exist
-            handle = self._pvfs.fcreate(name)
-            if not handle:
-                ok = False
-                break
-            try:
-                offset = 0
-                while offset < len(db_data):
-                    chunk = db_data[offset : offset + CHUNK]
-                    n = handle.write(chunk, len(chunk))
-                    if n != len(chunk):
-                        ok = False
-                        break
-                    offset += n
-                    handle.flush(commit=True)
-                if not ok:
-                    break
-            finally:
-                handle.close()
-
-        return ok
 
     
     def _open_channels(self, filename: str) -> bool:
@@ -613,4 +615,4 @@ class PvfsDataFile:
     @property
     def is_open(self) -> bool:
         """Check if file is open."""
-        return self._pvfs is not None 
+        return self._pvfs is not None

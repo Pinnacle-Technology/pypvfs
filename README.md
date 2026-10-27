@@ -62,7 +62,45 @@ pip install ".[test]"
 pytest
 ```
 
-> **Note on `pip install -e .`** — scikit-build-core's editable mode loads Python files from `src/pvfs_tools/`, but CMake-built `.dll` / `.so` files live in the `build/` directory. `pvfs_binding.py` looks for the native library next to itself, so an editable install will fail with “native library could not be loaded”. Use a regular install (or rebuild between edits) when you need the native code.
+**Editable installs:** `python -m pip install -e .` builds and installs the native
+libraries while loading Python code from `src/pvfs_tools/`. The binding searches
+the installed package path for native libraries before checking the source tree.
+Python edits apply immediately; after C++ edits, rerun the install command and
+restart Python to load the rebuilt libraries.
+
+On Windows, the default Visual Studio build needs the **Desktop development with
+C++** workload and a complete Windows SDK. If CMake reports no C++ compiler even
+though Visual Studio is installed, check `CMakeFiles/CMakeConfigureLog.yaml` in
+the build directory. Missing `ucrtd.lib` or `ucrt/stdio.h` indicates incomplete
+SDK components; repair/reinstall the SDK through Visual Studio Installer.
+
+Alternatively, select an installed LLVM-MinGW compiler explicitly with Ninja.
+Use a separate build directory when switching away from Visual Studio, and
+replace the compiler path below with your installation:
+
+```powershell
+$env:CMAKE_GENERATOR = "Ninja"
+python -m pip install -e . `
+  "--config-settings=build-dir=build/editable-clang" `
+  "--config-settings=cmake.define.CMAKE_CXX_COMPILER=C:/path/to/llvm-mingw/bin/clang++.exe"
+```
+
+Ninja must be available on `PATH`. This environment setting affects the current
+PowerShell session; remove it with `Remove-Item Env:CMAKE_GENERATOR` before
+switching back to Visual Studio.
+
+After updating the native sources or bindings, rebuild **both** native libraries
+with the same compiler and runtime. The read-only and overwrite bindings require
+the updated wrapper; previously built DLLs or shared libraries are not sufficient.
+MinGW installs include matching runtime DLLs from the compiler's directory.
+
+Native wrapper regression checks can be run alongside `pytest`:
+
+```bash
+cmake -S . -B build/native-tests -DPVFS_BUILD_TESTS=ON
+cmake --build build/native-tests --config Release
+ctest --test-dir build/native-tests -C Release --output-on-failure
+```
 
 ## Examples (bundled in the wheel)
 

@@ -18,6 +18,9 @@ ENV/
 env/
 src/venv/
 
+# local docs
+README_Dave.txt
+
 # Test / coverage
 .pytest_cache/
 .coverage
@@ -93,3 +96,5 @@ Desktop.ini
 temp.*
 *.bkp
 *.dtmp
+
+experiment.db

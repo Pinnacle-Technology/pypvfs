@@ -174,6 +174,10 @@ class IndexedDataFile:
         Returns:
             bool: True if successful, False otherwise
         """
+        # Reopening after create must release the original handles first.
+        self.close()
+        self._pvfs_file = pvfs_file
+
         # Construct filenames
         index_name = filename + self.INDEX_EXTENSION
         data_name = filename + self.DATA_EXTENSION
@@ -749,4 +753,4 @@ class IndexedDataFile:
         if self._index_file:
             self._index_file.flush()
         if self._data_file:
-            self._data_file.flush() 
+            self._data_file.flush()

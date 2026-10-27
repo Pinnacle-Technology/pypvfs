@@ -124,7 +124,7 @@ def create_pvfs_file(output_file="output.pvfs", frequency=2.0, sample_rate=400, 
             import tempfile
             
             # Open the PVFS file and extract the database
-            verify_pvfs = PvfsDataFile()
+            verify_pvfs = PvfsDataFile(read_only=True)
             if verify_pvfs.open(output_file):
                 print("  - Successfully opened PVFS file for verification")
                 
@@ -235,4 +235,4 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    main() 
+    main()

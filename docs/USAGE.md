@@ -60,7 +60,7 @@ A **`.pvfs` file** is a container of **named files** (channels). Typical names y
 ```python
 from pvfs_tools.Core.pvfs_binding import PvfsFile
 
-vfs = PvfsFile.open("/path/to/recording.pvfs")
+vfs = PvfsFile.open("/path/to/recording.pvfs", read_only=True)
 try:
     names = list(vfs.get_channel_list())
     files = list(vfs.get_file_list())
@@ -69,6 +69,12 @@ finally:
 ```
 
 Always **`close()`** when finished (tests also use `gc.collect()` and short sleeps on Windows so the OS releases file handles before deleting temp `.pvfs` files).
+
+The default `read_only=False` requests a writable handle and fails if another
+writer holds the recording. Use `read_only=True` for analysis or extraction,
+including while Sirenia is recording. A writable open never falls back to a
+reader. Readers see flushed data; this is not a transactionally consistent
+snapshot of an actively changing recording.
 
 ### Create a new empty PVFS
 
@@ -140,6 +146,28 @@ assert rc == 0
 ```
 
 On failure the binding may raise **`RuntimeError`** instead of returning a negative code—see **`PvfsFile.extract`** in `pvfs_binding.py`.
+
+`extract()` takes the PVFS lock internally and checks both reads and writes.
+Call it outside an existing `vfs.lock()` section, since the native lock is not
+recursive. A failed extraction may leave a partial output file.
+
+### Replace a member from a disk file
+
+```python
+vfs.overwrite("experiment.db3", "/tmp/snapshot.db3")
+```
+
+`overwrite()` stages the replacement before updating the directory entry and
+creates the member if it does not exist. Close any handles to that member first.
+It locks internally; use `lock=False` only when already holding the VFS lock.
+It raises `RuntimeError` on failure. The final directory update is not atomic
+against power loss. To force OS buffers to storage, open the resulting member
+and call `handle.flush(commit=True)`; ordinary `flush()` only writes buffers.
+
+The low-level `PvfsIndexHeaderWrapper.startTime` and `.endTime` fields are nested
+`PvfsHighTimeWrapper` values with `.seconds` and `.subseconds`, matching the
+native 56-byte wrapper. The wrapper uses a ten-second timestamp interval when
+writing headers; use `IndexedDataFile` for configurable timestamp intervals.
 
 ---
 
@@ -219,6 +247,13 @@ pdf.close()
 ```
 
 `create()` builds a temporary SQLite DB next to the PVFS, writes **`experiment.db3`** / backup into the container, and keeps schema aligned with real recordings. Always call **`close()`** so buffers flush into the PVFS (tests wait, then reopen with **`PvfsFile.open`** to verify).
+
+Use `PvfsDataFile(path, read_only=True)` for reading. Its flush and close paths
+do not save metadata back to the recording. Writable database saves replace
+primary and backup from the same staged snapshot under the PVFS lock, stopping
+before the backup if the primary replacement or commit fails. Synchronous saves
+commit once per completed entry. `flush()` raises on save failure; `close()`
+returns `False` and retains the working database for a retry.
 
 ---
 

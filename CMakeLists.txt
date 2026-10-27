@@ -25,11 +25,8 @@ set_target_properties(pvfs PROPERTIES
     INSTALL_RPATH "\$ORIGIN"
 )
 
-if(MSVC)
-    # PVFS_EXPORT = __declspec(dllexport) when building pvfs.dll itself
-    # (see src/pvfs_tools/Core/pvfs_global.h).
-    target_compile_definitions(pvfs PRIVATE PVFS_LIBRARY)
-endif()
+# Export the core symbols with both MSVC and MinGW on Windows.
+target_compile_definitions(pvfs PRIVATE PVFS_LIBRARY)
 
 # ---------- libpvfs_wrapper (the C ABI surface ctypes loads) ----------------
 
@@ -45,6 +42,11 @@ set_target_properties(pvfs_wrapper PROPERTIES
 )
 
 # ---------- Platform-specific compile/link tuning ---------------------------
+
+if(WIN32)
+    # MinGW defaults to lib*.dll; ctypes uses the same filenames as MSVC.
+    set_target_properties(pvfs pvfs_wrapper PROPERTIES PREFIX "")
+endif()
 
 if(MSVC)
     # /wd4251: STL types crossing DLL boundary (intentional in this wrapper).
@@ -71,12 +73,32 @@ endif()
 
 # ---------- Install rules (scikit-build-core picks these up) ----------------
 
-# Both shared libraries land next to pvfs_binding.py so ctypes.CDLL() finds
-# them by Path(__file__).parent / "<name>".
+option(PVFS_BUILD_TESTS "Build native wrapper contract tests" OFF)
+if(PVFS_BUILD_TESTS)
+    enable_testing()
+    add_executable(pvfs_wrapper_contract tests/native_wrapper_contract.cpp)
+    target_include_directories(pvfs_wrapper_contract PRIVATE "${PVFS_CORE_DIR}")
+    target_link_libraries(pvfs_wrapper_contract PRIVATE pvfs)
+    add_test(NAME pvfs_wrapper_contract COMMAND pvfs_wrapper_contract)
+endif()
+
+# Both libraries share an installed package directory. The binding locates it
+# through the package search path, including when Python sources are editable.
 install(TARGETS pvfs pvfs_wrapper
     LIBRARY DESTINATION pvfs_tools/Core   # .so on Linux / .dylib on macOS
     RUNTIME DESTINATION pvfs_tools/Core   # .dll on Windows
 )
+
+if(MINGW)
+    # Bundle matching compiler runtimes for wheels and editable installs.
+    get_filename_component(PVFS_COMPILER_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    foreach(runtime IN ITEMS libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll
+                             libc++.dll libunwind.dll)
+        if(EXISTS "${PVFS_COMPILER_BIN}/${runtime}")
+            install(FILES "${PVFS_COMPILER_BIN}/${runtime}" DESTINATION pvfs_tools/Core)
+        endif()
+    endforeach()
+endif()
 
 # Ship the top-level examples/ directory inside the installed package so users
 # can run them with:

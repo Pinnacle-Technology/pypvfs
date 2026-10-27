@@ -133,7 +133,7 @@ class PvfsToVideoConverter:
         db_path = None  # Initialize db_path before try block
         try:
             # Open PVFS file
-            self.vfs = PvfsFile.open(self.pvfs_file)
+            self.vfs = PvfsFile.open(self.pvfs_file, read_only=True)
             
             # Extract database
             db_path = os.path.join(os.path.dirname(self.pvfs_file), "temp.db3")
@@ -370,4 +370,4 @@ class PvfsToVideoConverter:
         
 if __name__ == "__main__":
     app = PvfsToVideoConverter()
-    app.run() 
+    app.run()

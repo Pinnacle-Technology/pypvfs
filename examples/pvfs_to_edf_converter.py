@@ -203,7 +203,7 @@ class PvfsToEdfConverter:
     def load_pvfs_file(self):
         try:
             # Open PVFS file
-            self.vfs = PvfsFile.open(self.pvfs_file)
+            self.vfs = PvfsFile.open(self.pvfs_file, read_only=True)
             
             # Extract database
             db_path = os.path.join(os.path.dirname(self.pvfs_file), "temp.db3")
@@ -650,4 +650,4 @@ class PvfsToEdfConverter:
         
 if __name__ == "__main__":
     app = PvfsToEdfConverter()
-    app.run() 
+    app.run()

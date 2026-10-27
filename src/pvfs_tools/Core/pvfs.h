@@ -57,6 +57,7 @@
 #define _PINNACLE_VIRTUAL_FILE_SYSTEM_H_
 
 #include "pvfs_global.h"
+
 #include <stdio.h>
 #include <time.h>
 #include <fcntl.h>
@@ -69,7 +70,9 @@
 
 #ifdef _WIN32
     // Windows-specific includes
+    #ifndef NOMINMAX
     #define NOMINMAX
+    #endif
     #include <windows.h>
     #include <stdint.h>
     #include <io.h>
@@ -304,7 +307,7 @@ struct PvfsFile {
     std::mutex lock;
 
     PvfsFile() : fd(-1), blockSize(0), tableLoc(0), nextBlock(0), fileMaxCount(0), treeMaxCount(0) {}
-    ~PvfsFile();  // Close fd so the .pvfs file is released (e.g. for test cleanup on Windows)
+    PVFS_EXPORT ~PvfsFile();
 };
 
 
@@ -468,6 +471,9 @@ PVFS_EXPORT std::int32_t PVFS_tree_add_data ( std::shared_ptr<PvfsFileHandle> &v
 // Utilities for quick file adding and removing for viewing.
 PVFS_EXPORT std::int32_t PVFS_add ( std::shared_ptr<PvfsFile> &vfs, const char * filename, const char * in_filename );
 PVFS_EXPORT std::int32_t PVFS_extract ( std::shared_ptr<PvfsFile> &vfs, const char * filename, const char * out_filename );
+// Caller holds the PVFS lock. Stages replacement blocks before publishing the
+// directory entry, then reclaims the previous blocks. Returns failure on I/O
+// errors. The final directory update is not power-loss atomic (no journal).
 PVFS_EXPORT std::int32_t PVFS_overwrite ( std::shared_ptr<PvfsFile> &vfs, const char * vfs_filename, const char * disk_filename );
 
 PVFS_EXPORT std::int32_t PVFS_get_channel_list(std::shared_ptr<PvfsFile> &vfs, std::vector<std::string> &names);

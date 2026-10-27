@@ -3,7 +3,47 @@
 #include <string.h>
 #include <iostream>
 #include <set>
+#include <cerrno>
+#ifdef _WIN32
+#include <share.h>
+#else
+#include <sys/file.h>
+#endif
 namespace pvfs {
+
+namespace {
+// Hold writer ownership on the recording itself for the descriptor's lifetime.
+// A sidecar file cannot protect against racing opens or an ignored/deleted lock.
+int openRecordingWriter(const char* filename, bool create)
+{
+    if (!filename) { errno = EINVAL; return PVFS_INVALID_FD; }
+#ifdef _WIN32
+    int fd = PVFS_INVALID_FD;
+    const int flags = _O_RDWR | _O_BINARY | _O_NOINHERIT
+        | (create ? _O_CREAT : 0);
+    if (_sopen_s(&fd, filename, flags, _SH_DENYWR, _S_IREAD | _S_IWRITE) != 0)
+        return PVFS_INVALID_FD;
+    // Acquire exclusive write access before truncating an existing recording.
+    if (create && _chsize_s(fd, 0) != 0) {
+        const int error = errno;
+        _close(fd);
+        errno = error;
+        return PVFS_INVALID_FD;
+    }
+#else
+    const int fd = open(filename, O_RDWR | O_CLOEXEC | (create ? O_CREAT : 0), S_IRUSR | S_IWUSR);
+    if (fd == PVFS_INVALID_FD) return fd;
+    // POSIX locks are advisory: all PVFS writers must use this entry point.
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0 || (create && ftruncate(fd, 0) != 0)) {
+        const int error = errno;
+        close(fd);
+        errno = error;
+        return PVFS_INVALID_FD;
+    }
+#endif
+    return fd;
+}
+}
 
 std::shared_ptr<pvfs::PvfsFile> createVFS(std::uint32_t blockSize)
 {
@@ -55,7 +95,7 @@ std::shared_ptr<PvfsFile> create_PVFS_file_structure ( std::uint32_t blockSize )
     vfs->fd					= PVFS_INVALID_FD;				// Invalid file handle.
     vfs->tableLoc			= PVFS_HEADER_SIZE;
     vfs->fileBlock			= nullptr;
-    vfs->blockSize			= PVFS_DEFAULT_BLOCK_SIZE;
+    vfs->blockSize			= blockSize;
     vfs->fileMaxCount		= 0;
     vfs->treeMaxCount		= 0;
     vfs->block				= nullptr;
@@ -94,6 +134,9 @@ void PVFS_file_set_blockSize ( std::shared_ptr<PvfsFile> &vfs, std::uint32_t blo
 
     vfs->block = create_PVFS_block ( vfs );
     vfs->fileBlock = create_PVFS_block_file ( vfs );
+    vfs->fileBlockTemp = create_PVFS_block_file(vfs);
+    vfs->treeBlockTemp = create_PVFS_block_tree(vfs);
+    vfs->dataBlockTemp = create_PVFS_block_data(vfs);
 
 }
 
@@ -135,6 +178,8 @@ std::int64_t PVFS_read_block ( int fd, std::int64_t address, std::shared_ptr<Pvf
     counter += PVFS_read_sint64 ( fd, block->self );
     counter += PVFS_read_sint64 ( fd, block->next );
     counter += PVFS_read_sint32 ( fd, block->count );
+    // Serialization of a tree/file block can shrink this scratch buffer.
+    block->data.resize(block->size);
     unsigned char* buffer = block->data.data();
 #ifdef _WIN32
     counter += _read ( fd, buffer, block->size );
@@ -144,42 +189,49 @@ std::int64_t PVFS_read_block ( int fd, std::int64_t address, std::shared_ptr<Pvf
     return counter;
 }
 
-std::int64_t PVFS_write_block ( int fd, std::int64_t address, std::shared_ptr<PvfsBlock> &block )
+namespace {
+bool writeAll(int fd, const void* bytes, size_t size)
 {
-    int64_t counter		= 0;
-    int64_t	location	= 0;
-    int32_t result;
-
-
-    if ( fd == PVFS_INVALID_FD ) return 0;
-    if ( !block ) return 0;
-    if ( block->size == 0 ) return 0;
-    if ( address == PVFS_INVALID_LOCATION ) return 0;
-
+    auto* data = static_cast<const unsigned char*>(bytes);
+    while (size) {
+        const auto written = p_write(fd, const_cast<unsigned char*>(data), size);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0 || static_cast<size_t>(written) > size) return false;
+        data += written;
+        size -= static_cast<size_t>(written);
+    }
+    return true;
+}
+bool commitFile(int fd)
+{
 #ifdef _WIN32
-    location = _lseeki64 ( fd, address, SEEK_SET );
+    return _commit(fd) == 0;
 #else
-    location = lseek ( fd, address, SEEK_SET );
+    return fsync(fd) == 0;
 #endif
-    if(location == -1)return 0;
-    counter += PVFS_write_uint8 ( fd, block->type );
-    counter += PVFS_write_sint64 ( fd, block->prev );
-    counter += PVFS_write_sint64 ( fd, block->self );
-    counter += PVFS_write_sint64 ( fd, block->next );
-    counter += PVFS_write_sint32 ( fd, block->count );
-    //This is different in the c code block->size bytes are always written
-
+}
+bool seekFile(int fd, int64_t address)
+{
 #ifdef _WIN32
-    result = _write ( fd, block->data.data(), static_cast<std::uint32_t>(block->data.size()));
+    return _lseeki64(fd, address, SEEK_SET) == address;
 #else
-    result = write ( fd, block->data.data(), static_cast<std::uint32_t>(block->data.size()));;
+    return lseek(fd, address, SEEK_SET) == address;
 #endif
-
-    if(result == -1)return 0;
-    counter += static_cast<int64_t>(result);
-    return counter;
+}
 }
 
+std::int64_t PVFS_write_block(int fd, std::int64_t address, std::shared_ptr<PvfsBlock>& block)
+{
+    if (fd == PVFS_INVALID_FD || !block || block->size == 0 || address < 0) return 0;
+    if (!seekFile(fd, address)
+        || !writeAll(fd, &block->type, sizeof(block->type))
+        || !writeAll(fd, &block->prev, sizeof(block->prev))
+        || !writeAll(fd, &block->self, sizeof(block->self))
+        || !writeAll(fd, &block->next, sizeof(block->next))
+        || !writeAll(fd, &block->count, sizeof(block->count))
+        || !writeAll(fd, block->data.data(), block->data.size())) return 0;
+    return PVFS_BLOCK_HEADER_SIZE + block->data.size();
+}
 
 std::shared_ptr<PvfsBlockData> create_PVFS_block_data ( std::shared_ptr<PvfsFile> &vfs )
 {
@@ -456,8 +508,8 @@ std::int64_t PVFS_read_block_file ( std::shared_ptr<PvfsFile> &vfs, int64_t addr
     return_address = PVFS_INVALID_LOCATION;
 
     return_address = PVFS_read_block ( vfs->fd, address, vfs->block );
-    PVFS_cast_block_to_file ( vfs->block, block );
-
+    if (return_address != PVFS_BLOCK_HEADER_SIZE + vfs->blockSize
+        || PVFS_cast_block_to_file(vfs->block, block) != PVFS_OK) return PVFS_INVALID_LOCATION;
     return return_address;
 }
 
@@ -472,8 +524,8 @@ std::int64_t PVFS_read_block_tree ( std::shared_ptr<PvfsFile> &vfs, int64_t addr
     return_address = PVFS_INVALID_LOCATION;
 
     return_address = PVFS_read_block ( vfs->fd, address, vfs->block );
-    PVFS_cast_block_to_tree ( vfs->block, block );
-
+    if (return_address != PVFS_BLOCK_HEADER_SIZE + vfs->blockSize
+        || PVFS_cast_block_to_tree(vfs->block, block) != PVFS_OK) return PVFS_INVALID_LOCATION;
     return return_address;
 }
 
@@ -488,8 +540,8 @@ std::int64_t PVFS_read_block_data ( std::shared_ptr<PvfsFile> &vfs, int64_t addr
     return_address = PVFS_INVALID_LOCATION;
 
     return_address = PVFS_read_block ( vfs->fd, address, vfs->block );
-    PVFS_cast_block_to_data ( vfs->block, block );
-
+    if (return_address != PVFS_BLOCK_HEADER_SIZE + vfs->blockSize
+        || PVFS_cast_block_to_data(vfs->block, block) != PVFS_OK) return PVFS_INVALID_LOCATION;
     return return_address;
 }
 
@@ -558,6 +610,9 @@ std::shared_ptr<PvfsFileHandle> create_PVFS_file_handle ( std::shared_ptr<PvfsFi
     file->info.size			= 0;
     file->info.startBlock	= 0;
     file->error				= PVFS_OK;
+    // A newly opened handle has nothing to write. In particular, seeking or
+    // crossing a block while reading a readonly archive must not flush it.
+    file->dirty = PVFS_CLEAN;
 
     file->block = create_PVFS_block ( vfs );
     if ( file->block == nullptr )
@@ -591,11 +646,7 @@ std::shared_ptr<PvfsFile> PVFS_create_size ( const char * filename, std::uint32_
     if ( !vfs ) return nullptr;
 
     PVFS_file_set_blockSize ( vfs, block_size );
-#ifdef _WIN32
-    vfs->fd = _open(filename, _O_CREAT | _O_RDWR | _O_BINARY | O_TRUNC, _S_IREAD | _S_IWRITE);
-#else
-    vfs->fd = open(filename, O_CREAT | O_RDWR | O_TRUNC, S_IRUSR | S_IWUSR);
-#endif
+    vfs->fd = openRecordingWriter(filename, true);
 
     if(vfs->fd == PVFS_INVALID_FD)
     {
@@ -645,11 +696,7 @@ std::shared_ptr<PvfsFile> PVFS_open( const char * filename )
     vfs = create_PVFS_file_structure();
     if ( !vfs ) return nullptr;
 
-#ifdef _WIN32
-    vfs->fd = _open ( filename, _O_BINARY | _O_RDWR, _S_IREAD | _S_IWRITE  );
-#else
-    vfs->fd = open(filename, O_RDWR, S_IRUSR | S_IWUSR);
-#endif
+    vfs->fd = openRecordingWriter(filename, false);
     if ( vfs->fd == PVFS_INVALID_FD )
     {
 //        destroy_PVFS_file ( vfs );
@@ -792,16 +839,10 @@ std::int32_t PVFS_write_free_block_table(std::shared_ptr<PvfsFile> &vfs, const s
     if (vfs->fd == PVFS_INVALID_FD) return PVFS_ERROR;
     if (table.size() != PVFS_FREE_BLOCK_TABLE_MAX_ENTRIES) return PVFS_ERROR;
 
-    #ifdef _WIN32
-    _lseeki64(vfs->fd, PVFS_HEADER_FREE_BLOCK_TABLE_DATA_OFFSET, SEEK_SET);
-    #else
-    lseek(vfs->fd, PVFS_HEADER_FREE_BLOCK_TABLE_DATA_OFFSET, SEEK_SET);
-    #endif
-
-    for (std::uint32_t i = 0; i < PVFS_FREE_BLOCK_TABLE_MAX_ENTRIES; i++)
-    {
-        PVFS_write_uint32(vfs->fd, table[i].blockSize);
-        PVFS_write_sint64(vfs->fd, table[i].nextFreeBlock);
+    if (!seekFile(vfs->fd, PVFS_HEADER_FREE_BLOCK_TABLE_DATA_OFFSET)) return PVFS_ERROR;
+    for (const auto& entry : table) {
+        if (!writeAll(vfs->fd, &entry.blockSize, sizeof(entry.blockSize))
+            || !writeAll(vfs->fd, &entry.nextFreeBlock, sizeof(entry.nextFreeBlock))) return PVFS_ERROR;
     }
 
     return PVFS_OK;
@@ -862,7 +903,7 @@ std::int32_t PVFS_add_free_block(std::shared_ptr<PvfsFile> &vfs, std::int64_t bl
 
     // Mark block as FREE and write it
     vfs->block->type = PVFS_BLOCK_TYPE_FREE;
-    PVFS_write_block(vfs->fd, blockAddress, vfs->block);
+    if (PVFS_write_block(vfs->fd, blockAddress, vfs->block) <= 0) return PVFS_ERROR;
 
     // Write updated table
     return PVFS_write_free_block_table(vfs, table);
@@ -909,7 +950,7 @@ std::int64_t PVFS_get_free_block(std::shared_ptr<PvfsFile> &vfs, std::uint32_t b
             }
 
             // Write updated table
-            PVFS_write_free_block_table(vfs, table);
+            if (PVFS_write_free_block_table(vfs, table) != PVFS_OK) return PVFS_INVALID_LOCATION;
 
             return freeBlock;
         }
@@ -939,17 +980,13 @@ std::int64_t PVFS_allocate_block(std::shared_ptr<PvfsFile> &pvfs)
     // No free block available (or block reuse disabled), allocate new block at end of file
     clearBlock<PvfsBlock>(pvfs->block, pvfs->block->size);
 
-    pvfs->block->self = pvfs->nextBlock;
-    pvfs->nextBlock += pvfs->blockSize + PVFS_BLOCK_HEADER_SIZE;
-
-    #ifdef _WIN32
-    (void)_lseeki64(pvfs->fd, pvfs->nextBlock, SEEK_SET);
-    #else
-    (void)lseek(pvfs->fd, pvfs->nextBlock, SEEK_SET);
-    #endif
-
-    PVFS_write_uint8(pvfs->fd, -1); // Mark the end of file (also forces the file to grow.)
-    return pvfs->block->self;
+    const auto address = pvfs->nextBlock;
+    const auto end = address + pvfs->blockSize + PVFS_BLOCK_HEADER_SIZE;
+    const uint8_t marker = 0xff;
+    if (!seekFile(pvfs->fd, end) || !writeAll(pvfs->fd, &marker, 1)) return 0;
+    pvfs->block->self = address;
+    pvfs->nextBlock = end;
+    return address;
 }
 
 
@@ -1044,6 +1081,7 @@ std::shared_ptr<PvfsFileHandle> PVFS_fcreate ( std::shared_ptr<PvfsFile> &vfs, c
     strcpy ( (char*) file_entry.filename, filename );
     file_entry.size		= 0;
     file_entry.startBlock = file->tree->self;
+
     if ( reuseIndex >= 0 )
     {
         // Reuse the deleted slot; do not grow the file block list.
@@ -1520,6 +1558,7 @@ std::int32_t PVFS_write ( std::shared_ptr<PvfsFileHandle> &vf, const uint8_t * b
     if ( !vf ) return PVFS_ARG_NULL;
     if ( buffer == nullptr ) return PVFS_ARG_NULL;
     if ( size <= 0 ) return 0;
+    if (!vf->vfs || !vf->data || vf->error == PVFS_ERROR) return PVFS_ERROR;
 
     // Set the dirt bit
     vf->dirty	= PVFS_DIRTY;		// From the putc
@@ -1528,6 +1567,7 @@ std::int32_t PVFS_write ( std::shared_ptr<PvfsFileHandle> &vf, const uint8_t * b
     i = 0;
     while ( i < size )
     {
+        vf->dirty = PVFS_DIRTY;
         copy_rem = size - i;
         block_rem = vf->data->maxCount - vf->dataAddress;
         if ( copy_rem < block_rem )
@@ -1562,7 +1602,7 @@ std::int32_t PVFS_write ( std::shared_ptr<PvfsFileHandle> &vf, const uint8_t * b
                 vf->data->data[vf->dataAddress + j] = *(buffer + i + j);
             } */
             memcpy ( vf->data->data.data() + vf->dataAddress, buffer + i, block_rem );
-            PVFS_flush ( vf );		// Done with this block.
+
 
             i += block_rem;
             count += block_rem;
@@ -1574,17 +1614,15 @@ std::int32_t PVFS_write ( std::shared_ptr<PvfsFileHandle> &vf, const uint8_t * b
                 vf->info.size = vf->currentAddress;
             }
 
-            if ( vf->dataAddress > vf->data->count )
-            {
-                vf->data->count = vf->dataAddress;
-            }
-
+            vf->data->count = vf->data->maxCount;
+            if (PVFS_flush(vf) != PVFS_OK) { vf->error = PVFS_ERROR; return PVFS_ERROR; }
+            vf->dirty = PVFS_DIRTY;
             vf->dataAddress = 0;
 
             if ( vf->data->next == PVFS_INVALID_LOCATION )
             {
                 // Create a new data block.
-                PVFS_allocate_block ( vf->vfs );
+                if (PVFS_allocate_block(vf->vfs) <= 0) { vf->error = PVFS_ERROR; return PVFS_ERROR; }
 
                 if(vf->vfs == nullptr)		return -1;
                 PVFS_cast_block_to_data ( vf->vfs->block, vf->vfs->dataBlockTemp );
@@ -1595,24 +1633,24 @@ std::int32_t PVFS_write ( std::shared_ptr<PvfsFileHandle> &vf, const uint8_t * b
                 vf->data->next					= vf->vfs->dataBlockTemp->self;
                 tree_address					= vf->data->tree;
                 vf->vfs->dataBlockTemp->prev	= vf->data->self;
-                PVFS_write_block_data ( vf->vfs, vf->data->self, vf->data );
+                if (PVFS_write_block_data ( vf->vfs, vf->data->self, vf->data ) <= 0) { vf->error = PVFS_ERROR; return PVFS_ERROR; }
 
                 // Need a not write-read way to do this...
                 address = vf->vfs->dataBlockTemp->self;
-                PVFS_write_block_data ( vf->vfs, address, vf->vfs->dataBlockTemp );
-                PVFS_read_block_data ( vf->vfs, address, vf->data );
+                if (PVFS_write_block_data ( vf->vfs, address, vf->vfs->dataBlockTemp ) <= 0) { vf->error = PVFS_ERROR; return PVFS_ERROR; }
+                if (PVFS_read_block_data ( vf->vfs, address, vf->data ) == PVFS_INVALID_LOCATION) { vf->error = PVFS_ERROR; return PVFS_ERROR; }
 
                 /////
                 // Add to the tree....
-                PVFS_read_block_tree ( vf->vfs, tree_address, vf->tree );
+                if (PVFS_read_block_tree ( vf->vfs, tree_address, vf->tree ) == PVFS_INVALID_LOCATION) { vf->error = PVFS_ERROR; return PVFS_ERROR; }
                 std::shared_ptr<PvfsLocationMap>	map = std::make_shared<PvfsLocationMap>();
                 map->address	= vf->currentAddress;
                 map->blockLoc	= vf->data->self;
-                PVFS_tree_add_data ( vf, vf->tree, map, vf->data );
+                if (PVFS_tree_add_data(vf, vf->tree, map, vf->data) != PVFS_OK) { vf->error = PVFS_ERROR; return PVFS_ERROR; }
             }
             else
             {
-                PVFS_read_block_data ( vf->vfs, vf->data->next, vf->data );
+                if (PVFS_read_block_data ( vf->vfs, vf->data->next, vf->data ) == PVFS_INVALID_LOCATION) { vf->error = PVFS_ERROR; return PVFS_ERROR; }
             }
         }
     }
@@ -1676,8 +1714,10 @@ std::int32_t PVFS_read ( std::shared_ptr<PvfsFileHandle> &vf, uint8_t * buffer, 
 
             }
 //            memcpy ( buffer + i, vf->data->data + vf->dataAddress, block_rem );
-            PVFS_flush ( vf );		// Necessary?  Only if there is unwritten data, so we'll leave it.
-            PVFS_read_block_data ( vf->vfs, vf->data->next, vf->data );
+            if (PVFS_flush(vf) != PVFS_OK) return PVFS_ERROR;
+            if (vf->currentAddress + block_rem < vf->info.size
+                && PVFS_read_block_data(vf->vfs, vf->data->next, vf->data) == PVFS_INVALID_LOCATION)
+                return PVFS_ERROR;
             vf->dataAddress = 0;
 
             i += block_rem;
@@ -1693,9 +1733,9 @@ std::int32_t PVFS_read ( std::shared_ptr<PvfsFileHandle> &vf, uint8_t * buffer, 
 std::int32_t PVFS_fclose ( std::shared_ptr<PvfsFileHandle> &vf )
 {
     if ( !vf ) return PVFS_OK;
-    PVFS_flush ( vf );
+    const auto result = PVFS_flush(vf);
     vf = nullptr;
-    return PVFS_OK;
+    return result;
 }
 
 //PVFS_dirty is only set by PVFS_Write
@@ -1719,51 +1759,25 @@ std::int32_t PVFS_fclose ( std::shared_ptr<PvfsFileHandle> &vf )
 // original behavior.
 //
 
-std::int32_t PVFS_flush ( std::shared_ptr<PvfsFileHandle> &vf, bool commit)
+std::int32_t PVFS_flush(std::shared_ptr<PvfsFileHandle>& vf, bool commit)
 {
-    PvfsFileEntry *	fileEntry;
-
-    if ( !vf ) return PVFS_ARG_NULL;
-    if ( vf->dirty == PVFS_CLEAN ) return PVFS_OK; // Has not been written to, so nothing to flush
-
-    // Update the file entry.
-    PVFS_read_block_file ( vf->vfs, vf->tableBlock, vf->vfs->fileBlock );
-    fileEntry = &(vf->vfs->fileBlock->files [ vf->tableIndex ]);
-    PVFS_copy_fileEntry ( fileEntry, &(vf->info) );
-    PVFS_write_block_file ( vf->vfs, vf->tableBlock, vf->vfs->fileBlock );
-
-    // Write out any pending data/tree.
-    if (vf->data ==nullptr)  return PVFS_ARG_NULL;
-    if (vf->tree == nullptr)  return PVFS_ARG_NULL;
-    PVFS_write_block_data ( vf->vfs, vf->data->self, vf->data );
-    PVFS_write_block_tree ( vf->vfs, vf->tree->self, vf->tree );
-    int fd = vf->vfs->fd;
-    if(fd != PVFS_INVALID_FD)
-    {
-
-        if(commit)
-        {
-#ifdef _WIN32
-                // For Windows
-                if (_commit(fd) == PVFS_INVALID_FD) {
-                    return PVFS_ERROR; // Error in flushing file descriptor
-                }
-#else
-                // For POSIX (Linux, UNIX, macOS)
-                if (fsync(fd) == -1) {
-                    return PVFS_ERROR; // Error in flushing file descriptor
-                }
-#endif
+    if (!vf || !vf->vfs) return PVFS_ARG_NULL;
+    if (vf->error == PVFS_ERROR) return PVFS_ERROR;
+    if (vf->dirty != PVFS_CLEAN) {
+        if (!vf->data || !vf->tree
+            || PVFS_write_block_data(vf->vfs, vf->data->self, vf->data) <= 0
+            || PVFS_write_block_tree(vf->vfs, vf->tree->self, vf->tree) <= 0) return PVFS_ERROR;
+        if (vf->tableIndex >= 0) {
+            if (PVFS_read_block_file(vf->vfs, vf->tableBlock, vf->vfs->fileBlock) == PVFS_INVALID_LOCATION
+                || static_cast<size_t>(vf->tableIndex) >= vf->vfs->fileBlock->files.size()) return PVFS_ERROR;
+            vf->vfs->fileBlock->files[vf->tableIndex] = vf->info;
+            if (PVFS_write_block_file(vf->vfs, vf->tableBlock, vf->vfs->fileBlock) <= 0) return PVFS_ERROR;
+        }
     }
-
-    }
-    // No longer dirty
+    if (commit && !commitFile(vf->vfs->fd)) return PVFS_ERROR;
     vf->dirty = PVFS_CLEAN;
-
     return PVFS_OK;
 }
-
-
 
 std::int32_t PVFS_tree_add_data ( std::shared_ptr<PvfsFileHandle> &vf, std::shared_ptr<PvfsBlockTree> &tree, std::shared_ptr<PvfsLocationMap> &map, std::shared_ptr<PvfsBlockData> &data )
 {
@@ -1781,9 +1795,9 @@ std::int32_t PVFS_tree_add_data ( std::shared_ptr<PvfsFileHandle> &vf, std::shar
         tree->mappings [ tree->count ].address		= map->address;
         tree->mappings [ tree->count ].blockLoc	= map->blockLoc;
         tree->count++;
-        PVFS_write_block_tree ( vf->vfs, tree->self, tree );
+        if (PVFS_write_block_tree ( vf->vfs, tree->self, tree ) <= 0) return PVFS_ERROR;
         data->tree = tree->self;
-        PVFS_write_block_data ( vf->vfs, data->self, data );
+        if (PVFS_write_block_data ( vf->vfs, data->self, data ) <= 0) return PVFS_ERROR;
         return PVFS_OK;
     }
     else // We have to mess with the tree.
@@ -1796,11 +1810,11 @@ std::int32_t PVFS_tree_add_data ( std::shared_ptr<PvfsFileHandle> &vf, std::shar
         //      then add the new branch.
         address = tree->up;
 
-        PVFS_allocate_block ( vf->vfs );
+        if (PVFS_allocate_block(vf->vfs) <= 0) return PVFS_ERROR;
         if(vf->vfs != nullptr){
             PVFS_cast_block_to_tree ( vf->vfs->block, vf->vfs->treeBlockTemp );
             vf->vfs->treeBlockTemp->up = address;					// Set so the up from this branch is the same as the other.
-            PVFS_tree_add ( vf, vf->vfs->treeBlockTemp, map );	// Should return quickly from the top part.
+            if (PVFS_tree_add ( vf, vf->vfs->treeBlockTemp, map ) != PVFS_OK) return PVFS_ERROR;	// Should return quickly from the top part.
         }else{
             return PVFS_ARG_NULL;
         }
@@ -1809,21 +1823,21 @@ std::int32_t PVFS_tree_add_data ( std::shared_ptr<PvfsFileHandle> &vf, std::shar
         // Set the data to point to the branch.
         //data->tree = address;
         data->tree = vf->vfs->treeBlockTemp->self;
-        PVFS_write_block_data ( vf->vfs, data->self, data );
+        if (PVFS_write_block_data ( vf->vfs, data->self, data ) <= 0) return PVFS_ERROR;
 
         map->address	= vf->currentAddress;
         map->blockLoc	= vf->vfs->treeBlockTemp->self;
 
         if ( address != PVFS_INVALID_LOCATION )
         {
-            PVFS_read_block_tree ( vf->vfs, address, vf->tree );
+            if (PVFS_read_block_tree ( vf->vfs, address, vf->tree ) == PVFS_INVALID_LOCATION) return PVFS_ERROR;
             return PVFS_tree_add ( vf, vf->tree, map );
         }
         else
         {
             // Create a new root.
             new_root = create_PVFS_block_tree ( vf->vfs );
-            PVFS_allocate_block ( vf->vfs );
+            if (PVFS_allocate_block(vf->vfs) <= 0) return PVFS_ERROR;
             if(vf->vfs != nullptr){
                 PVFS_cast_block_to_tree ( vf->vfs->block, new_root );
             }
@@ -1831,31 +1845,32 @@ std::int32_t PVFS_tree_add_data ( std::shared_ptr<PvfsFileHandle> &vf, std::shar
 
             // Old tree has the new root.
             tree->up = new_root->self;
-            PVFS_write_block_tree ( vf->vfs, tree->self, tree );
+            if (PVFS_write_block_tree ( vf->vfs, tree->self, tree ) <= 0) return PVFS_ERROR;
 
             // New tree gets the old map.
             map->address	= tree->mappings [ 0 ].address;
             map->blockLoc	= tree->self;
-            PVFS_tree_add ( vf, new_root, map );		// Should return quickly.
+            if (PVFS_tree_add ( vf, new_root, map ) != PVFS_OK) return PVFS_ERROR;		// Should return quickly.
 
             // Alter the tree passed in to have the new tree as the upper.
             map->address	= vf->currentAddress;
             if(vf->vfs){
                 if(vf->vfs->treeBlockTemp){
                     map->blockLoc	= vf->vfs->treeBlockTemp->self;
-                    PVFS_tree_add ( vf, new_root, map );		// Should return quickly.
+                    if (PVFS_tree_add ( vf, new_root, map ) != PVFS_OK) return PVFS_ERROR;		// Should return quickly.
 
                     vf->vfs->treeBlockTemp->up = new_root->self;
 
-                    PVFS_write_block_tree ( vf->vfs, vf->vfs->treeBlockTemp->self, vf->vfs->treeBlockTemp );
-                    PVFS_write_block_tree ( vf->vfs, new_root->self, new_root );
+                    if (PVFS_write_block_tree ( vf->vfs, vf->vfs->treeBlockTemp->self, vf->vfs->treeBlockTemp ) <= 0) return PVFS_ERROR;
+                    if (PVFS_write_block_tree ( vf->vfs, new_root->self, new_root ) <= 0) return PVFS_ERROR;
 
                     // Update the file entry.
                     vf->info.startBlock = new_root->self;
-                    PVFS_read_block_file ( vf->vfs, vf->tableBlock, vf->vfs->fileBlock );
+                    if (vf->tableIndex < 0) return PVFS_OK;
+                    if (PVFS_read_block_file ( vf->vfs, vf->tableBlock, vf->vfs->fileBlock ) == PVFS_INVALID_LOCATION) return PVFS_ERROR;
                     fileEntry = &vf->vfs->fileBlock->files [ vf->tableIndex ];
                     PVFS_copy_fileEntry ( fileEntry, &(vf->info) );
-                    PVFS_write_block_file ( vf->vfs, vf->tableBlock, vf->vfs->fileBlock );
+                    if (PVFS_write_block_file ( vf->vfs, vf->tableBlock, vf->vfs->fileBlock ) <= 0) return PVFS_ERROR;
 
                     return PVFS_OK;
                 }else{
@@ -1887,7 +1902,7 @@ std::int32_t PVFS_tree_add ( std::shared_ptr<PvfsFileHandle> &vf, std::shared_pt
         tree->mappings [ tree->count ].address		= map->address;
         tree->mappings [ tree->count ].blockLoc	= map->blockLoc;
         tree->count++;
-        PVFS_write_block_tree ( vf->vfs, tree->self, tree );
+        if (PVFS_write_block_tree ( vf->vfs, tree->self, tree ) <= 0) return PVFS_ERROR;
         return PVFS_OK;
     }
     else // We have to mess with the tree.
@@ -1900,7 +1915,7 @@ std::int32_t PVFS_tree_add ( std::shared_ptr<PvfsFileHandle> &vf, std::shared_pt
         //      then add the new branch.
         address = tree->up;
 
-        PVFS_allocate_block ( vf->vfs );
+        if (PVFS_allocate_block(vf->vfs) <= 0) return PVFS_ERROR;
 
         if(!vf->vfs)  return PVFS_ARG_NULL;
 
@@ -1909,48 +1924,49 @@ std::int32_t PVFS_tree_add ( std::shared_ptr<PvfsFileHandle> &vf, std::shared_pt
         if(!vf->vfs->treeBlockTemp)  return PVFS_ARG_NULL;
 
         vf->vfs->treeBlockTemp->up = address;					// Set so the up from this branch is the same as the other.
-        PVFS_tree_add ( vf, vf->vfs->treeBlockTemp, map );	// Should return quickly from the top part.
+        if (PVFS_tree_add ( vf, vf->vfs->treeBlockTemp, map ) != PVFS_OK) return PVFS_ERROR;	// Should return quickly from the top part.
 
         if ( address != PVFS_INVALID_LOCATION )
         {
             map->address	= vf->currentAddress;
             map->blockLoc	= vf->vfs->treeBlockTemp->self;
 
-            PVFS_read_block_tree ( vf->vfs, address, vf->tree );
+            if (PVFS_read_block_tree ( vf->vfs, address, vf->tree ) == PVFS_INVALID_LOCATION) return PVFS_ERROR;
             return PVFS_tree_add ( vf, vf->tree, map );
         }
         else	// Create a new root node.
         {
             new_root = create_PVFS_block_tree ( vf->vfs );
-            PVFS_allocate_block ( vf->vfs );
+            if (PVFS_allocate_block(vf->vfs) <= 0) return PVFS_ERROR;
             PVFS_cast_block_to_tree ( vf->vfs->block, new_root );
             new_root->up = PVFS_INVALID_LOCATION;
 
             // Old tree has the new root.
             tree->up = new_root->self;
-            PVFS_write_block_tree ( vf->vfs, tree->self, tree );
+            if (PVFS_write_block_tree ( vf->vfs, tree->self, tree ) <= 0) return PVFS_ERROR;
 
             // New tree gets the old map.
             map->address	= tree->mappings [ 0 ].address;
             map->blockLoc	= tree->self;
-            PVFS_tree_add ( vf, new_root, map );		// Should return quickly.
+            if (PVFS_tree_add ( vf, new_root, map ) != PVFS_OK) return PVFS_ERROR;		// Should return quickly.
 
             // Alter the tree passed in to have the new tree as the upper.
             map->address	= vf->currentAddress;
             map->blockLoc	= vf->vfs->treeBlockTemp->self;
-            PVFS_tree_add ( vf, new_root, map );		// Should return quickly.
+            if (PVFS_tree_add ( vf, new_root, map ) != PVFS_OK) return PVFS_ERROR;		// Should return quickly.
 
             vf->vfs->treeBlockTemp->up = new_root->self;
 
-            PVFS_write_block_tree ( vf->vfs, vf->vfs->treeBlockTemp->self, vf->vfs->treeBlockTemp );
-            PVFS_write_block_tree ( vf->vfs, new_root->self, new_root );
+            if (PVFS_write_block_tree ( vf->vfs, vf->vfs->treeBlockTemp->self, vf->vfs->treeBlockTemp ) <= 0) return PVFS_ERROR;
+            if (PVFS_write_block_tree ( vf->vfs, new_root->self, new_root ) <= 0) return PVFS_ERROR;
 
             // Update the file entry.
             vf->info.startBlock = new_root->self;
-            PVFS_read_block_file ( vf->vfs, vf->tableBlock, vf->vfs->fileBlock );
+                    if (vf->tableIndex < 0) return PVFS_OK;
+            if (PVFS_read_block_file ( vf->vfs, vf->tableBlock, vf->vfs->fileBlock ) == PVFS_INVALID_LOCATION) return PVFS_ERROR;
             fileEntry = &vf->vfs->fileBlock->files [ vf->tableIndex ];
             PVFS_copy_fileEntry ( fileEntry, &(vf->info) );
-            PVFS_write_block_file ( vf->vfs, vf->tableBlock, vf->vfs->fileBlock );
+            if (PVFS_write_block_file ( vf->vfs, vf->tableBlock, vf->vfs->fileBlock ) <= 0) return PVFS_ERROR;
 
             return PVFS_OK;
         }
@@ -2035,157 +2051,165 @@ std::int32_t PVFS_add ( std::shared_ptr<PvfsFile> &vfs, const char * filename, c
 }
 
 
-std::int32_t PVFS_extract ( std::shared_ptr<PvfsFile> &vfs, const char * filename, const char * out_filename )
+namespace {
+struct ScopedDescriptor {
+    int fd = PVFS_INVALID_FD;
+    ~ScopedDescriptor() {
+        if (fd != PVFS_INVALID_FD) {
+#ifdef _WIN32
+            _close(fd);
+#else
+            close(fd);
+#endif
+        }
+    }
+};
+}
+
+std::int32_t PVFS_extract(std::shared_ptr<PvfsFile>& vfs, const char* filename, const char* out_filename)
 {
-    int						fd					=	0;					// File to create.
-    std::uint8_t			buffer [ 1024 ];							// Buffer for reading and writing data.
-    std::shared_ptr<pvfs::PvfsFileHandle>	vf  =	nullptr;			// File to extract.
-    std::int32_t			rv					=	0;					// How many bytes were read
-
-    if ( !vfs ) return PVFS_ARG_NULL;
-    if ( filename == nullptr ) return PVFS_ARG_NULL;
-    if ( out_filename == nullptr ) return PVFS_ARG_NULL;
-
-    vf = PVFS_fopen ( vfs, filename );
-    if ( vf == nullptr )
-    {
-        //_close ( fd );
-        return PVFS_FILE_NOT_OPENED;
+    if (!vfs || !filename || !out_filename) return PVFS_ARG_NULL;
+    auto file = PVFS_fopen(vfs, filename);
+    if (!file || file->info.size < 0) return PVFS_FILE_NOT_OPENED;
+    ScopedDescriptor output;
+#ifdef _WIN32
+    output.fd = _open(out_filename, _O_BINARY | _O_CREAT | _O_TRUNC | _O_WRONLY, _S_IREAD | _S_IWRITE);
+#else
+    output.fd = open(out_filename, O_CREAT | O_TRUNC | O_WRONLY, S_IRUSR | S_IWUSR);
+#endif
+    if (output.fd == PVFS_INVALID_FD) return PVFS_FILE_NOT_OPENED;
+    uint8_t buffer[16384];
+    int64_t remaining = file->info.size;
+    while (remaining > 0) {
+        const auto requested = static_cast<uint32_t>(std::min<int64_t>(remaining, sizeof(buffer)));
+        const auto count = PVFS_read(file, buffer, requested);
+        if (count < 0 || static_cast<uint32_t>(count) != requested) return PVFS_ERROR;
+        if (!writeAll(output.fd, buffer, requested)) return PVFS_ERROR;
+        remaining -= count;
     }
-
-#ifdef _WIN32
-    fd = _creat(out_filename, _S_IREAD | _S_IWRITE);
-    if (fd == PVFS_INVALID_FD) return PVFS_FILE_NOT_OPENED;
-    _close(fd);
-    fd = _open(out_filename, _O_BINARY | _O_CREAT | _O_RDWR, _S_IREAD | _S_IWRITE);
-    if (fd == PVFS_INVALID_FD) return PVFS_FILE_NOT_OPENED;
-#else
-    fd = creat(out_filename, S_IRUSR | S_IWUSR);
-    if (fd == PVFS_INVALID_FD) return PVFS_FILE_NOT_OPENED;
-    close(fd);
-    fd = open(out_filename, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
-    if (fd == PVFS_INVALID_FD) return PVFS_FILE_NOT_OPENED;
-#endif
-
-    memset ( buffer, 0, 1024 );
-
-    //TMP
-    //sint32 total = 0;
-    // -----
-    rv = PVFS_read ( vf, buffer, 1024 );
-
-    while ( rv > 0 )
-    {
-#ifdef _WIN32
-        _write ( fd, buffer, rv );
-#else
-        write ( fd, buffer, rv );
-#endif
-        rv = PVFS_read ( vf, buffer, 1024 );
-    }
-
-    PVFS_fclose ( vf );
-
-#ifdef _WIN32
-    _close ( fd );
-#else
-    close ( fd );
-#endif
-
     return PVFS_OK;
 }
 
-// Over write the vfs file with one from the disk.
-std::int32_t PVFS_overwrite ( std::shared_ptr<PvfsFile> &vfs, const char * vfs_filename, const char * disk_filename )
+// Write a detached replacement first. The live directory entry and its blocks
+// remain intact until all replacement data has been flushed successfully.
+// The final directory update is NOT power-loss atomic: the PVFS format has no
+// metadata journal. On an ambiguous publication failure retain both block sets.
+std::int32_t PVFS_overwrite(std::shared_ptr<PvfsFile>& vfs, const char* vfs_filename, const char* disk_filename)
 {
-    int                             fd			=	0;				// File to add.
-    std::uint8_t					buffer [ 1024 ];				// Buffer to move data around.
-    std::shared_ptr<PvfsFileHandle>	vf			=	NULL;			// Internal file pointer.
+    if (!vfs || !vfs_filename || !disk_filename) return PVFS_ARG_NULL;
+    if (!*vfs_filename || strlen(vfs_filename) >= PVFS_MAX_FILENAME_LENGTH) return PVFS_ERROR;
+    ScopedDescriptor input;
 #ifdef _WIN32
-    struct _stati64                 stats;							// Stats for the size of the file to add.
+    input.fd = _open(disk_filename, _O_BINARY | _O_RDONLY);
+    struct _stati64 stats;
+    if (input.fd == PVFS_INVALID_FD || _fstati64(input.fd, &stats) != 0) return PVFS_FILE_NOT_OPENED;
 #else
-    struct stat64                   stats;
+    input.fd = open(disk_filename, O_RDONLY);
+    struct stat stats;
+    if (input.fd == PVFS_INVALID_FD || fstat(input.fd, &stats) != 0) return PVFS_FILE_NOT_OPENED;
 #endif
-    int                             rv			=	0;				// Return value in read
-    std::int32_t                    w;
+    if (stats.st_size < 0) return PVFS_ERROR;
 
-    if ( !vfs ) return PVFS_ARG_NULL;
-    if ( vfs_filename == NULL ) return PVFS_ARG_NULL;
-    if ( disk_filename == NULL ) return PVFS_ARG_NULL;
-
-#ifdef _WIN32
-    fd = _open ( disk_filename, _O_BINARY | _O_RDWR, _S_IREAD );
-    if ( fd == PVFS_INVALID_FD ) return PVFS_FILE_NOT_OPENED;
-    _fstati64 ( fd, &stats );
-#else
-    fd = open(disk_filename, O_RDWR, S_IRUSR);
-    if (fd == PVFS_INVALID_FD) return PVFS_FILE_NOT_OPENED;
-    fstat64(fd, &stats);
-#endif
-
-    // If the file already exists in the VFS, delete it first to free old blocks
-    if ( PVFS_has_file ( vfs, vfs_filename ) )
-    {
-        std::int32_t delete_result = PVFS_delete_file ( vfs, vfs_filename );
-        if ( delete_result != PVFS_OK )
-        {
-#ifdef _WIN32
-            _close ( fd );
-#else
-            close ( fd );
-#endif
-            return PVFS_ERROR;
+    // Locate the original entry, or a free directory slot. Use independent
+    // buffers because block allocation and tree growth reuse vfs's scratch data.
+    auto directory = create_PVFS_block_file(vfs);
+    auto selected = create_PVFS_block_file(vfs);
+    if (!directory || !selected) return PVFS_ERROR;
+    int index = -1;
+    bool replacing = false;
+    std::set<int64_t> visited;
+    for (int64_t address = vfs->tableLoc; address != PVFS_INVALID_LOCATION; address = directory->next) {
+        if (!visited.insert(address).second
+            || PVFS_read_block_file(vfs, address, directory) == PVFS_INVALID_LOCATION) return PVFS_ERROR;
+        for (size_t i = 0; i < directory->files.size(); ++i) {
+            const auto& entry = directory->files[i];
+            if (strncmp(reinterpret_cast<const char*>(entry.filename), vfs_filename, PVFS_MAX_FILENAME_LENGTH) == 0) {
+                *selected = *directory;
+                index = static_cast<int>(i);
+                replacing = true;
+                break;
+            }
+            if (index < 0 && entry.filename[0] == 0) {
+                *selected = *directory;
+                index = static_cast<int>(i);
+            }
         }
+        if (replacing) break;
+    }
+    if (index < 0) *selected = *directory;
+    std::vector<int64_t> oldTrees, oldData;
+    if (replacing && PVFS_collect_file_blocks(vfs, selected->files[index].startBlock, oldTrees, oldData) != PVFS_OK)
+        return PVFS_ERROR;
+
+    auto staged = create_PVFS_file_handle(vfs);
+    if (!staged) return PVFS_ERROR;
+    staged->tableIndex = -1; // Detached: flush/tree growth must not publish it.
+    const auto treeAddress = PVFS_allocate_block(vfs);
+    if (treeAddress <= 0) return PVFS_ERROR;
+    staged->tree->self = treeAddress;
+    const auto dataAddress = PVFS_allocate_block(vfs);
+    if (dataAddress <= 0) return PVFS_ERROR;
+    staged->data->self = dataAddress;
+    staged->data->tree = treeAddress;
+    staged->tree->mappings[0].address = 0;
+    staged->tree->mappings[0].blockLoc = dataAddress;
+    staged->tree->count = 1;
+    staged->info.startBlock = treeAddress;
+    staged->info.size = 0;
+    strcpy(reinterpret_cast<char*>(staged->info.filename), vfs_filename);
+    staged->currentAddress = 0;
+    staged->dataAddress = 0;
+    staged->dirty = PVFS_DIRTY;
+
+    uint8_t buffer[16384];
+    int64_t remaining = stats.st_size;
+    while (remaining > 0) {
+        const auto requested = static_cast<size_t>(std::min<int64_t>(remaining, sizeof(buffer)));
+        const auto count = p_read(input.fd, buffer, requested);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0 || count > remaining
+            || PVFS_write(staged, buffer, static_cast<uint32_t>(count)) != count) return PVFS_ERROR;
+        remaining -= count;
+    }
+    uint8_t extra;
+    if (p_read(input.fd, &extra, 1) != 0 || staged->info.size != stats.st_size
+        || PVFS_flush(staged, false) != PVFS_OK) return PVFS_ERROR;
+
+    // Only now publish the fully written replacement. Preserve the existing
+    // policy: OS write completion here, forced durability at explicit flushes.
+    // A failed publication must not recycle either block set.
+    const auto before = *selected;
+    if (index >= 0) {
+        selected->files[index] = staged->info;
+    } else if (selected->files.size() < vfs->fileMaxCount) {
+        selected->files.push_back(staged->info);
+    } else {
+        auto next = create_PVFS_block_file(vfs);
+        if (!next) return PVFS_ERROR;
+        next->self = PVFS_allocate_block(vfs);
+        if (next->self <= 0) return PVFS_ERROR;
+        next->prev = selected->self;
+        next->files.push_back(staged->info);
+        if (PVFS_write_block_file(vfs, next->self, next) <= 0) return PVFS_ERROR;
+        selected->next = next->self;
+    }
+    if (PVFS_write_block_file(vfs, selected->self, selected) <= 0) {
+        // Best effort rollback for recoverable I/O errors; never claim success.
+        *selected = before;
+        PVFS_write_block_file(vfs, selected->self, selected);
+        return PVFS_ERROR;
     }
 
-    // Create the new file
-    vf = PVFS_fcreate ( vfs, vfs_filename );
-    if ( !vf )
-    {
-#ifdef _WIN32
-        _close ( fd );
-#else
-        close ( fd );
-#endif
-        return PVFS_FILE_NOT_OPENED;
-    }
-
-    memset ( buffer, 0, 1024 );
-
-    {
-#ifdef _WIN32
-        rv = _read ( fd, buffer, 1024 );
-#else
-        rv = read ( fd, buffer, 1024 );
-#endif
-        w = 0;
-        //total = 0;
-        while ( rv > 0 )
-        {
-            //total += rv;
-            w += PVFS_write ( vf, buffer, rv );
-#ifdef _WIN32
-            rv = _read ( fd, buffer, 1024 );
-#else
-            rv = read ( fd, buffer, 1024 );
-#endif
-
-        }
-#ifdef _WIN32
-        _close ( fd );
-#else
-        close ( fd );
-#endif
-        //PVFS_flush ( vf );
-        PVFS_fclose ( vf );
-
-    }
-
+    // Reclaim only after publication. Failed pre-publication writes can leak
+    // unreachable blocks, deliberately preferring space loss to data loss.
+    for (const auto address : oldData)
+        if (PVFS_add_free_block(vfs, address, vfs->blockSize) != PVFS_OK) return PVFS_ERROR;
+    for (const auto address : oldTrees)
+        if (PVFS_add_free_block(vfs, address, vfs->blockSize) != PVFS_OK) return PVFS_ERROR;
     return PVFS_OK;
 }
 
 
-//helper write/read
 std::int64_t p_write(int fd, void *buf, size_t count)
 {
 #ifdef _WIN32
